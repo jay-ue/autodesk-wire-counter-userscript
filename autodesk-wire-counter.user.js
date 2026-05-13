@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.1
+// @version      0.7.2
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.1'
+  const SCRIPT_VERSION = '0.7.2'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -639,7 +639,7 @@
     return row
   }
 
-  async function focusRowModel(row) {
+  function focusRowModel(row) {
     if (!state.viewer || !row) {
       return
     }
@@ -660,22 +660,12 @@
     }
 
     try {
-      const target = await resolveRowFocusTarget(model, row, dbId)
-      if (!target) {
-        setStatus(`定位失败：${normalizeText(row.identifier) || dbId} 的模型节点不是线管`)
-        return
-      }
-
-      updateRowModelTarget(row, target.model, target.dbId)
       state.suppressSelectionCaptureUntil = Date.now() + 800
-      state.viewer.select([target.dbId], target.model)
+      state.viewer.select([dbId], model)
       if (typeof state.viewer.fitToView === 'function') {
-        state.viewer.fitToView([target.dbId], target.model)
+        state.viewer.fitToView([dbId], model)
       }
       setStatus(`\u5df2\u5b9a\u4f4d\uff1a${normalizeText(row.identifier) || dbId}`)
-      persistState()
-      renderRows()
-      activateRow(row)
     } catch (error) {
       console.warn('Failed to focus wire counter row', error)
       setStatus(`定位失败：${normalizeText(row.identifier) || dbId}`)
@@ -1115,7 +1105,7 @@
             return
           }
 
-          void focusRowModel(row)
+          focusRowModel(row)
         })
         tr.addEventListener('dragstart', (event) => {
           const target = event.target
@@ -2500,12 +2490,7 @@
   async function normalizeDbId(model, dbId) {
     const recordedRow = findRecordedRowForDbId(model, dbId)
     if (recordedRow) {
-      const recordedInfo = await findPipeInfoInHierarchy(model, recordedRow.dbId)
-      if (rowMatchesPipeInfo(recordedRow, recordedInfo)) {
-        updateRowModelTarget(recordedRow, model, recordedInfo.dbId)
-        mergePipeInfoIntoRow(recordedRow, recordedInfo)
-        return Number(recordedInfo.dbId)
-      }
+      return Number(recordedRow.dbId)
     }
 
     let currentId = dbId
@@ -2969,9 +2954,6 @@
     }
 
     setStatus(TEXT.viewerReady)
-    pageWindow.setTimeout(() => {
-      void cleanupRecordedRows()
-    }, 800)
   }
 
   function patchViewerPrototype(candidate) {
