@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.0
+// @version      0.7.1
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,8 +20,9 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.0'
+  const SCRIPT_VERSION = '0.7.1'
   const WIRE_HOVER_PIXEL_RADIUS = 3
+  const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
   const TEXT = {
     title: '\u7ebf\u7ba1\u7edf\u8ba1\u9762\u677f',
@@ -60,6 +61,28 @@
     'pipe',
     'carrier',
     'segment',
+  ]
+
+  const NON_PHYSICAL_LINE_KEYWORDS = [
+    '\u4e2d\u5fc3\u7ebf',
+    '\u6a21\u578b\u7ebf',
+    '\u8be6\u56fe\u7ebf',
+    '\u53c2\u7167\u7ebf',
+    '\u8f74\u7ebf',
+    '\u8def\u5f84\u7ebf',
+    '\u8f6e\u5ed3\u7ebf',
+    '\u7ebf\u6bb5',
+    '\u591a\u6bb5\u7ebf',
+    '\u6837\u6761\u66f2\u7ebf',
+    'centerline',
+    'center line',
+    'model line',
+    'detail line',
+    'symbolic line',
+    'reference line',
+    'polyline',
+    'spline',
+    'sketch',
   ]
 
   const LENGTH_KEYS = [
@@ -120,6 +143,7 @@
     pendingCaptureKeys: new Set(),
     persistTimer: 0,
     suppressSelectionCaptureUntil: 0,
+    cleanupRunning: false,
     rows: new Map(),
     collapsedCircuits: new Set(),
     attachedViewerIds: new WeakSet(),
@@ -517,6 +541,21 @@
       .join(' ')
 
     return PIPE_KEYWORDS.some((keyword) => haystack.includes(keyword.toLowerCase()))
+  }
+
+  function looksLikeNonPhysicalLine(propertyMap, fallbackName) {
+    const haystack = [
+      fallbackName,
+      findPropertyValue(propertyMap, ['\u7c7b\u522b', 'category']),
+      findPropertyValue(propertyMap, ['name']),
+      findPropertyValue(propertyMap, ['\u65cf', 'family']),
+      findPropertyValue(propertyMap, ['\u7c7b\u578b', 'type']),
+      findPropertyValue(propertyMap, ['subcategory', '\u5b50\u7c7b\u522b']),
+    ]
+      .map((value) => getPropertyEntryText(value).toLowerCase())
+      .join(' ')
+
+    return NON_PHYSICAL_LINE_KEYWORDS.some((keyword) => haystack.includes(keyword.toLowerCase()))
   }
 
   function getModelId(model) {
@@ -2142,6 +2181,80 @@
     return normalizeText(tree.getNodeName(dbId))
   }
 
+  function getNodeFragmentBounds(model, dbId) {
+    const tree = getInstanceTree(model)
+    const fragmentList =
+      typeof model?.getFragmentList === 'function' ? model.getFragmentList() : model?.getData?.().fragments
+    const Box3 = pageWindow.THREE?.Box3
+
+    if (
+      !tree ||
+      typeof tree.enumNodeFragments !== 'function' ||
+      !fragmentList ||
+      typeof fragmentList.getWorldBounds !== 'function' ||
+      typeof Box3 !== 'function'
+    ) {
+      return null
+    }
+
+    const bounds = new Box3()
+    const fragmentBounds = new Box3()
+    let fragmentCount = 0
+
+    try {
+      tree.enumNodeFragments(
+        dbId,
+        (fragId) => {
+          fragmentList.getWorldBounds(fragId, fragmentBounds)
+          bounds.union(fragmentBounds)
+          fragmentCount += 1
+        },
+        false,
+      )
+    } catch {
+      return null
+    }
+
+    if (fragmentCount === 0 || !bounds.min || !bounds.max) {
+      return null
+    }
+
+    return bounds
+  }
+
+  function getBoundDimensions(bounds) {
+    if (!bounds?.min || !bounds?.max) {
+      return null
+    }
+
+    return [
+      Math.abs(bounds.max.x - bounds.min.x),
+      Math.abs(bounds.max.y - bounds.min.y),
+      Math.abs(bounds.max.z - bounds.min.z),
+    ].sort((left, right) => right - left)
+  }
+
+  function getPhysicalPipeGeometryStatus(model, dbId, lengthMeters) {
+    const dimensions = getBoundDimensions(getNodeFragmentBounds(model, dbId))
+    if (!dimensions) {
+      return null
+    }
+
+    const [longest, middle] = dimensions
+    if (!Number.isFinite(longest) || longest <= 0 || !Number.isFinite(middle)) {
+      return false
+    }
+
+    const unitsPerMeter =
+      Number.isFinite(lengthMeters) && lengthMeters > 0 ? longest / lengthMeters : 0
+
+    if (unitsPerMeter > 0) {
+      return middle / unitsPerMeter >= MIN_PHYSICAL_PIPE_THICKNESS_METERS
+    }
+
+    return middle > longest * 0.001
+  }
+
   async function getProperties(model, dbId) {
     return await new Promise((resolve, reject) => {
       try {
@@ -2173,20 +2286,29 @@
     const propertyMap = getPropertyMap(properties.properties)
     const name = normalizeText(properties.name || getNodeName(model, normalizedDbId) || TEXT.unnamed)
     const lengthProperty = findPropertyValue(propertyMap, LENGTH_KEYS)
+    const lengthMeters = parseLengthMeters(lengthProperty)
+    const isNonPhysicalLine = looksLikeNonPhysicalLine(propertyMap, name)
+    const hasPhysicalGeometry = getPhysicalPipeGeometryStatus(model, normalizedDbId, lengthMeters)
 
     return {
       model,
       dbId: normalizedDbId,
       propertyMap,
       name,
-      isPipe: looksLikePipe(propertyMap, name),
+      isPipe: looksLikePipe(propertyMap, name) && !isNonPhysicalLine && hasPhysicalGeometry !== false,
+      isNonPhysicalLine,
+      hasPhysicalGeometry,
       identifier: getIdentifierFromProperties(propertyMap, normalizedDbId),
       level: getPropertyEntryText(findPropertyValue(propertyMap, LEVEL_KEYS)),
       pipeModel: getPropertyEntryText(findPropertyValue(propertyMap, MODEL_KEYS)),
       pipeSize: buildPropertySourceText(findPropertyValue(propertyMap, SIZE_KEYS)),
-      lengthMeters: parseLengthMeters(lengthProperty),
+      lengthMeters,
       lengthSourceText: buildLengthSourceText(lengthProperty),
     }
+  }
+
+  function isRecordablePipeInfo(info) {
+    return Boolean(info?.isPipe && info.lengthMeters != null && info.lengthMeters > 0)
   }
 
   async function findPipeInfoInHierarchy(model, dbId) {
@@ -2200,9 +2322,13 @@
       }
 
       const info = await getPipeRecordInfo(model, currentId)
+      if (info?.isNonPhysicalLine || info?.hasPhysicalGeometry === false) {
+        return info
+      }
+
       if (info?.isPipe) {
         fallbackPipeInfo = info
-        if (info.lengthMeters != null && info.lengthMeters > 0) {
+        if (isRecordablePipeInfo(info)) {
           return info
         }
       }
@@ -2223,7 +2349,7 @@
   }
 
   function rowMatchesPipeInfo(row, info) {
-    if (!info?.isPipe || info.lengthMeters == null || info.lengthMeters <= 0) {
+    if (!isRecordablePipeInfo(info)) {
       return false
     }
 
@@ -2319,6 +2445,58 @@
     return null
   }
 
+  async function cleanupRecordedRows() {
+    if (state.cleanupRunning || state.rows.size === 0) {
+      return
+    }
+
+    state.cleanupRunning = true
+    let repairedCount = 0
+    let removedCount = 0
+
+    try {
+      for (const row of Array.from(state.rows.values())) {
+        const model = findModelById(row.modelId)
+        if (!model) {
+          continue
+        }
+
+        let info = null
+        try {
+          info = await getPipeRecordInfo(model, row.dbId)
+        } catch {
+          continue
+        }
+
+        if (rowMatchesPipeInfo(row, info)) {
+          mergePipeInfoIntoRow(row, info)
+          continue
+        }
+
+        const repairedInfo = await findPipeTargetByIdentifier(model, row)
+        if (rowMatchesPipeInfo(row, repairedInfo)) {
+          updateRowModelTarget(row, repairedInfo.model, repairedInfo.dbId)
+          mergePipeInfoIntoRow(row, repairedInfo)
+          repairedCount += 1
+          continue
+        }
+
+        if (info && (info.isNonPhysicalLine || info.hasPhysicalGeometry === false || !info.isPipe)) {
+          state.rows.delete(row.key)
+          removedCount += 1
+        }
+      }
+
+      if (repairedCount > 0 || removedCount > 0) {
+        persistState()
+        renderRows()
+        setStatus(`已校验记录：修正 ${repairedCount} 条，清理细线/非线管 ${removedCount} 条`)
+      }
+    } finally {
+      state.cleanupRunning = false
+    }
+  }
+
   async function normalizeDbId(model, dbId) {
     const recordedRow = findRecordedRowForDbId(model, dbId)
     if (recordedRow) {
@@ -2339,13 +2517,15 @@
     }
 
     for (let index = 0; index < 8; index += 1) {
-      const properties = await getProperties(model, currentId)
-      const propertyMap = getPropertyMap(properties.properties)
-      const currentName = normalizeText(properties.name || getNodeName(model, currentId))
+      const info = await getPipeRecordInfo(model, currentId)
 
-      if (looksLikePipe(propertyMap, currentName)) {
+      if (info?.isNonPhysicalLine || info?.hasPhysicalGeometry === false) {
+        return currentId
+      }
+
+      if (info?.isPipe) {
         fallbackPipeId = currentId
-        if (parseLengthMeters(findPropertyValue(propertyMap, LENGTH_KEYS)) != null) {
+        if (isRecordablePipeInfo(info)) {
           return currentId
         }
       }
@@ -2377,27 +2557,21 @@
 
     try {
       const normalizedDbId = await normalizeDbId(model, rawDbId)
-      const properties = await getProperties(model, normalizedDbId)
-      const propertyMap = getPropertyMap(properties.properties)
-      const name = normalizeText(
-        properties.name || getNodeName(model, normalizedDbId) || TEXT.unnamed,
-      )
-      const isPipe = looksLikePipe(propertyMap, name)
-      const lengthProperty = findPropertyValue(propertyMap, LENGTH_KEYS)
-      const lengthMeters = parseLengthMeters(lengthProperty)
-      const lengthSourceText = buildLengthSourceText(lengthProperty)
+      const recordInfo = await getPipeRecordInfo(model, normalizedDbId)
 
-      if (!isPipe || lengthMeters == null || lengthMeters <= 0) {
+      if (!isRecordablePipeInfo(recordInfo)) {
         if (!deferUi) {
-          setStatus(`${TEXT.notPipePrefix}${name || `dbId ${normalizedDbId}`}`)
+          setStatus(`${TEXT.notPipePrefix}${recordInfo?.name || `dbId ${normalizedDbId}`}`)
         }
         return null
       }
 
-      const identifier = getIdentifierFromProperties(propertyMap, normalizedDbId)
-      const level = getPropertyEntryText(findPropertyValue(propertyMap, LEVEL_KEYS))
-      const pipeModel = getPropertyEntryText(findPropertyValue(propertyMap, MODEL_KEYS))
-      const pipeSize = buildPropertySourceText(findPropertyValue(propertyMap, SIZE_KEYS))
+      const identifier = recordInfo.identifier
+      const level = recordInfo.level
+      const pipeModel = recordInfo.pipeModel
+      const pipeSize = recordInfo.pipeSize
+      const lengthMeters = recordInfo.lengthMeters
+      const lengthSourceText = recordInfo.lengthSourceText
       const key = getRowKey(model, normalizedDbId)
       const existing = state.rows.get(key)
 
@@ -2795,6 +2969,9 @@
     }
 
     setStatus(TEXT.viewerReady)
+    pageWindow.setTimeout(() => {
+      void cleanupRecordedRows()
+    }, 800)
   }
 
   function patchViewerPrototype(candidate) {
