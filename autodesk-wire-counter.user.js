@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.6.6
+// @version      0.6.7
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.6.6'
+  const SCRIPT_VERSION = '0.6.7'
 
   const TEXT = {
     title: '\u7ebf\u7ba1\u7edf\u8ba1\u9762\u677f',
@@ -2314,12 +2314,13 @@
     await captureSelectionPairs(dbIds.map((dbId) => ({ model, dbId })))
   }
 
-  function getHitTestResult(viewer, event) {
+  function getHitTestResult(viewer, event, options = {}) {
     const hitTest = viewer?.impl?.hitTest
     if (typeof hitTest !== 'function') {
       return null
     }
 
+    const ignoreTransparent = Boolean(options.ignoreTransparent)
     const canvas = viewer.impl?.canvas || viewer.canvas || viewer.container?.querySelector?.('canvas')
     const rect = canvas?.getBoundingClientRect?.()
     const x = rect ? event.clientX - rect.left : event.offsetX
@@ -2331,7 +2332,7 @@
 
     for (const [hitX, hitY] of attempts) {
       try {
-        const result = hitTest.call(viewer.impl, hitX, hitY, true)
+        const result = hitTest.call(viewer.impl, hitX, hitY, ignoreTransparent)
         if (result?.dbId != null) {
           return result
         }
@@ -2377,7 +2378,7 @@
         return
       }
 
-      const hit = getHitTestResult(viewer, event)
+      const hit = getHitTestResult(viewer, event, { ignoreTransparent: false })
       const dbId = Number(hit?.dbId)
       const model = hit?.model || viewer.model
 
