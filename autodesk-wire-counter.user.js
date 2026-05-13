@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.6.8
+// @version      0.6.9
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.6.8'
+  const SCRIPT_VERSION = '0.6.9'
   const WIRE_HOVER_PIXEL_RADIUS = 3
 
   const TEXT = {
@@ -154,7 +154,7 @@
     state.currentCircuitCode = normalizeText(snapshot.currentCircuitCode)
     state.currentCircuitName = normalizeText(snapshot.currentCircuitName)
     state.defaultWireModel = normalizeText(snapshot.defaultWireModel) || DEFAULT_WIRE_MODEL
-    state.defaultWireCount = Math.max(0, Number(snapshot.defaultWireCount) || 0)
+    state.defaultWireCount = toNonNegativeNumber(snapshot.defaultWireCount, DEFAULT_WIRE_COUNT)
     state.panelPosition =
       snapshot.panelPosition &&
       Number.isFinite(snapshot.panelPosition.left) &&
@@ -171,14 +171,9 @@
     state.collapsedCircuits = new Set(toArray(snapshot.collapsedCircuits).map(normalizeText))
     state.rows = new Map(
       toArray(snapshot.rows)
-        .filter((row) => row && row.key)
-        .map((row, index) => [
-          row.key,
-          {
-            ...row,
-            createdAt: Number(row.createdAt) || index + 1,
-          },
-        ]),
+        .filter((row) => row && typeof row === 'object')
+        .map((row, index) => normalizeRow(row, index))
+        .map((row) => [row.key, row]),
     )
     removeDuplicateRecordedRows()
     normalizeAllRowOrder()
@@ -194,6 +189,46 @@
 
   function formatNumber(value) {
     return Number.isFinite(value) ? value.toFixed(2) : '0.00'
+  }
+
+  function toSafeNumber(value, fallback = 0) {
+    const number = Number(value)
+    return Number.isFinite(number) ? number : fallback
+  }
+
+  function toNonNegativeNumber(value, fallback = 0) {
+    return Math.max(0, toSafeNumber(value, fallback))
+  }
+
+  function normalizeRow(row, index = 0) {
+    const modelId = normalizeText(row.modelId) || 'default-model'
+    const dbId = Math.trunc(toSafeNumber(row.dbId, index + 1))
+    const key = normalizeText(row.key) || `${modelId}:${String(dbId)}`
+    const lengthMeters = toNonNegativeNumber(row.lengthMeters)
+    const wireCount = toNonNegativeNumber(row.wireCount, DEFAULT_WIRE_COUNT)
+    const createdAt = toSafeNumber(row.createdAt, Date.now() + index)
+    const orderIndex = Math.max(1, Math.trunc(toSafeNumber(row.orderIndex, index + 1)))
+
+    return {
+      ...row,
+      key,
+      modelId,
+      dbId,
+      createdAt,
+      orderIndex,
+      identifier: normalizeText(row.identifier) || String(dbId),
+      name: normalizeText(row.name),
+      customName: normalizeText(row.customName),
+      level: normalizeText(row.level),
+      pipeModel: normalizeText(row.pipeModel),
+      pipeSize: normalizeText(row.pipeSize),
+      lengthMeters,
+      lengthSourceText: normalizeText(row.lengthSourceText),
+      wireModel: normalizeText(row.wireModel) || DEFAULT_WIRE_MODEL,
+      wireCount,
+      circuitCode: normalizeText(row.circuitCode),
+      circuitName: normalizeText(row.circuitName),
+    }
   }
 
   function getDisplayName(row) {
@@ -2228,6 +2263,12 @@
         `${TEXT.recordedPrefix}\u6784\u4ef6 ${identifier}\uff0c\u7ba1\u957f ${formatNumber(lengthMeters)} m\uff08\u5c5e\u6027\u539f\u503c\uff1a${lengthSourceText || '-'}\uff09`,
       )
       return nextRow
+    } catch (error) {
+      console.warn('Failed to capture wire counter object', error)
+      if (!deferUi) {
+        setStatus(`读取线管属性失败：dbId ${rawDbId}`)
+      }
+      return null
     } finally {
       state.pendingCaptureKeys.delete(captureKey)
     }
