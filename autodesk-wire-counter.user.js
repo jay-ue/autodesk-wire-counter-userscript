@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.6.9
+// @version      0.7.0
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.6.9'
+  const SCRIPT_VERSION = '0.7.0'
   const WIRE_HOVER_PIXEL_RADIUS = 3
 
   const TEXT = {
@@ -119,6 +119,7 @@
     dragRowKey: '',
     pendingCaptureKeys: new Set(),
     persistTimer: 0,
+    suppressSelectionCaptureUntil: 0,
     rows: new Map(),
     collapsedCircuits: new Set(),
     attachedViewerIds: new WeakSet(),
@@ -200,10 +201,25 @@
     return Math.max(0, toSafeNumber(value, fallback))
   }
 
+  function parseRowKey(key) {
+    const text = normalizeText(key)
+    const separatorIndex = text.lastIndexOf(':')
+    if (separatorIndex <= 0) {
+      return { modelId: '', dbId: null }
+    }
+
+    const dbId = Number(text.slice(separatorIndex + 1))
+    return {
+      modelId: text.slice(0, separatorIndex),
+      dbId: Number.isInteger(dbId) ? dbId : null,
+    }
+  }
+
   function normalizeRow(row, index = 0) {
-    const modelId = normalizeText(row.modelId) || 'default-model'
-    const dbId = Math.trunc(toSafeNumber(row.dbId, index + 1))
-    const key = normalizeText(row.key) || `${modelId}:${String(dbId)}`
+    const keyParts = parseRowKey(row.key)
+    const modelId = normalizeText(row.modelId) || keyParts.modelId || 'default-model'
+    const dbId = Math.trunc(toSafeNumber(row.dbId, keyParts.dbId ?? index + 1))
+    const key = `${modelId}:${String(dbId)}`
     const lengthMeters = toNonNegativeNumber(row.lengthMeters)
     const wireCount = toNonNegativeNumber(row.wireCount, DEFAULT_WIRE_COUNT)
     const createdAt = toSafeNumber(row.createdAt, Date.now() + index)
@@ -554,11 +570,37 @@
       typeof state.viewer?.getAllModels === 'function'
         ? state.viewer.getAllModels()
         : [state.viewer?.model].filter(Boolean)
+    const normalizedModelId = normalizeText(modelId)
+    const exactModel = models.find((model) => getModelId(model) === normalizedModelId)
 
-    return models.find((model) => getModelId(model) === modelId) || state.viewer?.model || null
+    if (exactModel) {
+      return exactModel
+    }
+
+    return models.length === 1 ? models[0] : null
   }
 
-  function focusRowModel(row) {
+  function updateRowModelTarget(row, model, dbId) {
+    const nextDbId = Number(dbId)
+    if (!row || !model || !Number.isInteger(nextDbId)) {
+      return row
+    }
+
+    const previousKey = row.key
+    const nextKey = getRowKey(model, nextDbId)
+    row.modelId = getModelId(model)
+    row.dbId = nextDbId
+    row.key = nextKey
+
+    if (previousKey !== nextKey) {
+      state.rows.delete(previousKey)
+      state.rows.set(nextKey, row)
+    }
+
+    return row
+  }
+
+  async function focusRowModel(row) {
     if (!state.viewer || !row) {
       return
     }
@@ -568,18 +610,36 @@
     const model = findModelById(row.modelId)
     const dbId = Number(row.dbId)
 
-    if (!model || !Number.isInteger(dbId)) {
+    if (!model) {
+      setStatus(`无法定位模型：${normalizeText(row.identifier) || row.dbId}`)
+      return
+    }
+
+    if (!Number.isInteger(dbId)) {
+      setStatus(`无法定位构件：${normalizeText(row.identifier) || row.dbId}`)
       return
     }
 
     try {
-      state.viewer.select([dbId], model)
+      const target = await resolveRowFocusTarget(model, row, dbId)
+      if (!target) {
+        setStatus(`定位失败：${normalizeText(row.identifier) || dbId} 的模型节点不是线管`)
+        return
+      }
+
+      updateRowModelTarget(row, target.model, target.dbId)
+      state.suppressSelectionCaptureUntil = Date.now() + 800
+      state.viewer.select([target.dbId], target.model)
       if (typeof state.viewer.fitToView === 'function') {
-        state.viewer.fitToView([dbId], model)
+        state.viewer.fitToView([target.dbId], target.model)
       }
       setStatus(`\u5df2\u5b9a\u4f4d\uff1a${normalizeText(row.identifier) || dbId}`)
+      persistState()
+      renderRows()
+      activateRow(row)
     } catch (error) {
       console.warn('Failed to focus wire counter row', error)
+      setStatus(`定位失败：${normalizeText(row.identifier) || dbId}`)
     }
   }
 
@@ -612,41 +672,8 @@
     return null
   }
 
-  function findRecordedRowByIdentifier(model, identifier) {
-    const normalizedIdentifier = normalizeText(identifier)
-    if (!model || !normalizedIdentifier) {
-      return null
-    }
-
-    const modelId = getModelId(model)
-    return (
-      Array.from(state.rows.values()).find(
-        (row) => row.modelId === modelId && normalizeText(row.identifier) === normalizedIdentifier,
-      ) || null
-    )
-  }
-
   function removeDuplicateRecordedRows() {
-    const seen = new Map()
-
-    for (const row of Array.from(state.rows.values()).sort(
-      (left, right) => getRowSortValue(left) - getRowSortValue(right),
-    )) {
-      const identifier = normalizeText(row.identifier)
-      const duplicateKey = identifier ? `${normalizeText(row.modelId)}|${identifier}` : row.key
-      const existing = seen.get(duplicateKey)
-
-      if (!existing) {
-        seen.set(duplicateKey, row)
-        continue
-      }
-
-      existing.pipeSize = normalizeText(existing.pipeSize) || normalizeText(row.pipeSize)
-      existing.pipeModel = normalizeText(existing.pipeModel) || normalizeText(row.pipeModel)
-      existing.lengthSourceText =
-        normalizeText(existing.lengthSourceText) || normalizeText(row.lengthSourceText)
-      state.rows.delete(row.key)
-    }
+    state.rows = new Map(Array.from(state.rows.values()).map((row) => [row.key, row]))
   }
 
   function persistStateNow() {
@@ -1049,7 +1076,7 @@
             return
           }
 
-          focusRowModel(row)
+          void focusRowModel(row)
         })
         tr.addEventListener('dragstart', (event) => {
           const target = event.target
@@ -2129,10 +2156,178 @@
     })
   }
 
+  function getIdentifierFromProperties(propertyMap, fallbackDbId) {
+    return (
+      getPropertyEntryText(findPropertyValue(propertyMap, IDENTIFIER_KEYS)) ||
+      `${getPropertyEntryText(findPropertyValue(propertyMap, ['element id'])) || fallbackDbId}`
+    )
+  }
+
+  async function getPipeRecordInfo(model, dbId) {
+    const normalizedDbId = Number(dbId)
+    if (!model || !Number.isInteger(normalizedDbId) || normalizedDbId < 0) {
+      return null
+    }
+
+    const properties = await getProperties(model, normalizedDbId)
+    const propertyMap = getPropertyMap(properties.properties)
+    const name = normalizeText(properties.name || getNodeName(model, normalizedDbId) || TEXT.unnamed)
+    const lengthProperty = findPropertyValue(propertyMap, LENGTH_KEYS)
+
+    return {
+      model,
+      dbId: normalizedDbId,
+      propertyMap,
+      name,
+      isPipe: looksLikePipe(propertyMap, name),
+      identifier: getIdentifierFromProperties(propertyMap, normalizedDbId),
+      level: getPropertyEntryText(findPropertyValue(propertyMap, LEVEL_KEYS)),
+      pipeModel: getPropertyEntryText(findPropertyValue(propertyMap, MODEL_KEYS)),
+      pipeSize: buildPropertySourceText(findPropertyValue(propertyMap, SIZE_KEYS)),
+      lengthMeters: parseLengthMeters(lengthProperty),
+      lengthSourceText: buildLengthSourceText(lengthProperty),
+    }
+  }
+
+  async function findPipeInfoInHierarchy(model, dbId) {
+    let currentId = Number(dbId)
+    const tree = getInstanceTree(model)
+    let fallbackPipeInfo = null
+
+    for (let index = 0; index < 8; index += 1) {
+      if (!Number.isInteger(currentId) || currentId < 0) {
+        return fallbackPipeInfo
+      }
+
+      const info = await getPipeRecordInfo(model, currentId)
+      if (info?.isPipe) {
+        fallbackPipeInfo = info
+        if (info.lengthMeters != null && info.lengthMeters > 0) {
+          return info
+        }
+      }
+
+      if (!tree || typeof tree.getNodeParentId !== 'function') {
+        return fallbackPipeInfo
+      }
+
+      const parentId = tree.getNodeParentId(currentId)
+      if (!Number.isInteger(parentId) || parentId < 0 || parentId === currentId) {
+        return fallbackPipeInfo
+      }
+
+      currentId = parentId
+    }
+
+    return fallbackPipeInfo
+  }
+
+  function rowMatchesPipeInfo(row, info) {
+    if (!info?.isPipe || info.lengthMeters == null || info.lengthMeters <= 0) {
+      return false
+    }
+
+    const rowIdentifier = normalizeText(row.identifier)
+    const infoIdentifier = normalizeText(info.identifier)
+    if (rowIdentifier && infoIdentifier && rowIdentifier !== infoIdentifier) {
+      return false
+    }
+
+    const rowLength = toNonNegativeNumber(row.lengthMeters)
+    if (rowLength > 0 && Math.abs(rowLength - info.lengthMeters) > Math.max(0.05, rowLength * 0.08)) {
+      return false
+    }
+
+    return true
+  }
+
+  function mergePipeInfoIntoRow(row, info) {
+    if (!row || !info) {
+      return
+    }
+
+    row.identifier = normalizeText(row.identifier) || normalizeText(info.identifier)
+    row.name = normalizeText(row.name) || normalizeText(info.name)
+    row.level = normalizeText(row.level) || normalizeText(info.level)
+    row.pipeModel = normalizeText(row.pipeModel) || normalizeText(info.pipeModel)
+    row.pipeSize = normalizeText(row.pipeSize) || normalizeText(info.pipeSize)
+    row.lengthSourceText = normalizeText(row.lengthSourceText) || normalizeText(info.lengthSourceText)
+    row.lengthMeters = toNonNegativeNumber(row.lengthMeters, info.lengthMeters)
+  }
+
+  async function searchModelDbIds(model, text) {
+    const query = normalizeText(text)
+    if (!query || typeof model?.search !== 'function') {
+      return []
+    }
+
+    return await new Promise((resolve) => {
+      try {
+        model.search(
+          query,
+          (dbIds) =>
+            resolve(
+              toArray(dbIds)
+                .map((value) => Number(value))
+                .filter((value) => Number.isInteger(value) && value >= 0),
+            ),
+          () => resolve([]),
+        )
+      } catch {
+        resolve([])
+      }
+    })
+  }
+
+  async function findPipeTargetByIdentifier(model, row) {
+    const identifier = normalizeText(row.identifier)
+    if (!identifier) {
+      return null
+    }
+
+    const dbIds = await searchModelDbIds(model, identifier)
+    const seen = new Set()
+
+    for (const dbId of dbIds.slice(0, 80)) {
+      if (seen.has(dbId)) {
+        continue
+      }
+      seen.add(dbId)
+
+      const info = await findPipeInfoInHierarchy(model, dbId)
+      if (rowMatchesPipeInfo(row, info)) {
+        return info
+      }
+    }
+
+    return null
+  }
+
+  async function resolveRowFocusTarget(model, row, dbId) {
+    const directInfo = await findPipeInfoInHierarchy(model, dbId)
+    if (rowMatchesPipeInfo(row, directInfo)) {
+      mergePipeInfoIntoRow(row, directInfo)
+      return directInfo
+    }
+
+    const repairedInfo = await findPipeTargetByIdentifier(model, row)
+    if (repairedInfo) {
+      mergePipeInfoIntoRow(row, repairedInfo)
+      return repairedInfo
+    }
+
+    return null
+  }
+
   async function normalizeDbId(model, dbId) {
     const recordedRow = findRecordedRowForDbId(model, dbId)
     if (recordedRow) {
-      return Number(recordedRow.dbId)
+      const recordedInfo = await findPipeInfoInHierarchy(model, recordedRow.dbId)
+      if (rowMatchesPipeInfo(recordedRow, recordedInfo)) {
+        updateRowModelTarget(recordedRow, model, recordedInfo.dbId)
+        mergePipeInfoIntoRow(recordedRow, recordedInfo)
+        return Number(recordedInfo.dbId)
+      }
     }
 
     let currentId = dbId
@@ -2199,14 +2394,12 @@
         return null
       }
 
-      const identifier =
-        getPropertyEntryText(findPropertyValue(propertyMap, IDENTIFIER_KEYS)) ||
-        `${getPropertyEntryText(findPropertyValue(propertyMap, ['element id'])) || normalizedDbId}`
+      const identifier = getIdentifierFromProperties(propertyMap, normalizedDbId)
       const level = getPropertyEntryText(findPropertyValue(propertyMap, LEVEL_KEYS))
       const pipeModel = getPropertyEntryText(findPropertyValue(propertyMap, MODEL_KEYS))
       const pipeSize = buildPropertySourceText(findPropertyValue(propertyMap, SIZE_KEYS))
       const key = getRowKey(model, normalizedDbId)
-      const existing = state.rows.get(key) || findRecordedRowByIdentifier(model, identifier)
+      const existing = state.rows.get(key)
 
       if (existing) {
         existing.level = normalizeText(existing.level) || level
@@ -2577,6 +2770,10 @@
 
     if (viewing?.AGGREGATE_SELECTION_CHANGED_EVENT) {
       viewer.addEventListener(viewing.AGGREGATE_SELECTION_CHANGED_EVENT, (event) => {
+        if (Date.now() < state.suppressSelectionCaptureUntil) {
+          return
+        }
+
         void captureSelectionPairs(
           toArray(event.selections).flatMap((selection) => {
             const model = selection.model || viewer.model
@@ -2588,6 +2785,10 @@
 
     if (viewing?.SELECTION_CHANGED_EVENT) {
       viewer.addEventListener(viewing.SELECTION_CHANGED_EVENT, (event) => {
+        if (Date.now() < state.suppressSelectionCaptureUntil) {
+          return
+        }
+
         const model = event.model || viewer.model
         void captureSelectionPairs(toArray(event.dbIdArray).map((dbId) => ({ model, dbId })))
       })
