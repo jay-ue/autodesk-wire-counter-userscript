@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.6.7
+// @version      0.6.8
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,8 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.6.7'
+  const SCRIPT_VERSION = '0.6.8'
+  const WIRE_HOVER_PIXEL_RADIUS = 3
 
   const TEXT = {
     title: '\u7ebf\u7ba1\u7edf\u8ba1\u9762\u677f',
@@ -2321,7 +2322,7 @@
     }
 
     const ignoreTransparent = Boolean(options.ignoreTransparent)
-    const canvas = viewer.impl?.canvas || viewer.canvas || viewer.container?.querySelector?.('canvas')
+    const canvas = getViewerCanvas(viewer)
     const rect = canvas?.getBoundingClientRect?.()
     const x = rect ? event.clientX - rect.left : event.offsetX
     const y = rect ? event.clientY - rect.top : event.offsetY
@@ -2342,6 +2343,96 @@
     }
 
     return null
+  }
+
+  function getViewerCanvas(viewer) {
+    return viewer?.impl?.canvas || viewer?.canvas || viewer?.container?.querySelector?.('canvas') || null
+  }
+
+  function getCanvasPointer(viewer, event) {
+    const canvas = getViewerCanvas(viewer)
+    const rect = canvas?.getBoundingClientRect?.()
+    if (!canvas || !rect || rect.width <= 0 || rect.height <= 0) {
+      return null
+    }
+
+    const cssX = event.clientX - rect.left
+    const cssY = event.clientY - rect.top
+    if (cssX < 0 || cssY < 0 || cssX > rect.width || cssY > rect.height) {
+      return null
+    }
+
+    return { canvas, rect, cssX, cssY }
+  }
+
+  function getCanvasGlContext(canvas) {
+    if (!canvas) {
+      return null
+    }
+
+    if (canvas.__awcGlContext) {
+      return canvas.__awcGlContext
+    }
+
+    for (const contextName of ['webgl2', 'webgl', 'experimental-webgl']) {
+      try {
+        const gl = canvas.getContext?.(contextName)
+        if (gl) {
+          canvas.__awcGlContext = gl
+          return gl
+        }
+      } catch {
+        // Some Autodesk Viewer builds reject repeated context lookup names.
+      }
+    }
+
+    return null
+  }
+
+  function isWireHoverPixel(red, green, blue, alpha) {
+    if (alpha < 40) {
+      return false
+    }
+
+    return red >= 135 && red > green * 1.45 && red > blue * 1.45 && green <= 120 && blue <= 120
+  }
+
+  function hasWirePixelNearPointer(viewer, event) {
+    const pointer = getCanvasPointer(viewer, event)
+    const gl = getCanvasGlContext(pointer?.canvas)
+    if (!pointer || !gl || typeof gl.readPixels !== 'function') {
+      return false
+    }
+
+    const bufferWidth = gl.drawingBufferWidth || pointer.canvas.width
+    const bufferHeight = gl.drawingBufferHeight || pointer.canvas.height
+    if (!bufferWidth || !bufferHeight) {
+      return false
+    }
+
+    const pixelX = Math.round((pointer.cssX / pointer.rect.width) * bufferWidth)
+    const pixelY = Math.round((1 - pointer.cssY / pointer.rect.height) * bufferHeight)
+    const radiusX = Math.max(1, Math.round((WIRE_HOVER_PIXEL_RADIUS / pointer.rect.width) * bufferWidth))
+    const radiusY = Math.max(1, Math.round((WIRE_HOVER_PIXEL_RADIUS / pointer.rect.height) * bufferHeight))
+    const x = Math.max(0, Math.min(bufferWidth - 1, pixelX - radiusX))
+    const y = Math.max(0, Math.min(bufferHeight - 1, pixelY - radiusY))
+    const width = Math.max(1, Math.min(bufferWidth - x, radiusX * 2 + 1))
+    const height = Math.max(1, Math.min(bufferHeight - y, radiusY * 2 + 1))
+    const pixels = new Uint8Array(width * height * 4)
+
+    try {
+      gl.readPixels(x, y, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
+    } catch {
+      return false
+    }
+
+    for (let index = 0; index < pixels.length; index += 4) {
+      if (isWireHoverPixel(pixels[index], pixels[index + 1], pixels[index + 2], pixels[index + 3])) {
+        return true
+      }
+    }
+
+    return false
   }
 
   function installViewerHover(viewer) {
@@ -2389,6 +2480,11 @@
 
       const row = findRecordedRowForDbId(model, dbId)
       if (!row) {
+        hideHoverTooltip()
+        return
+      }
+
+      if (!hasWirePixelNearPointer(viewer, event)) {
         hideHoverTooltip()
         return
       }

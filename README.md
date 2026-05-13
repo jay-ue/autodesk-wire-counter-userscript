@@ -12,4 +12,4 @@ https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/a
 
 脚本头部已写入 `@updateURL` 和 `@downloadURL`，以后只要 GitHub 上的版本号增加，Tampermonkey 就可以检查到更新。
 
-当前版本：`0.6.7`
+当前版本：`0.6.8`
