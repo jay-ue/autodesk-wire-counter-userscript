@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.4
+// @version      0.7.5
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.4'
+  const SCRIPT_VERSION = '0.7.5'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -675,10 +675,82 @@
     })
   }
 
+  function findStableElementDbIdsInTree(model, stableElementId) {
+    const tree = getInstanceTree(model)
+    const targetStableId = normalizeText(stableElementId)
+    if (
+      !tree ||
+      !targetStableId ||
+      typeof tree.enumNodeChildren !== 'function' ||
+      typeof tree.getRootId !== 'function'
+    ) {
+      return []
+    }
+
+    const dbIds = []
+    const rootId = Number(tree.getRootId())
+    const visit = (dbId) => {
+      if (!Number.isInteger(dbId) || dbId < 0) {
+        return
+      }
+
+      const nodeStableId = extractBracketedElementId(getNodeName(model, dbId))
+      if (nodeStableId === targetStableId) {
+        dbIds.push(dbId)
+      }
+    }
+
+    try {
+      visit(rootId)
+      tree.enumNodeChildren(rootId, visit, true)
+    } catch (error) {
+      console.warn('Failed to scan Autodesk model tree', error)
+    }
+
+    return dbIds
+  }
+
+  async function findStableElementDbIds(model, stableElementId) {
+    const targetStableId = normalizeText(stableElementId)
+    const dbIds = []
+    const seen = new Set()
+    const addDbIds = (nextDbIds) => {
+      toArray(nextDbIds).forEach((value) => {
+        const dbId = Number(value)
+        if (Number.isInteger(dbId) && dbId >= 0 && !seen.has(dbId)) {
+          seen.add(dbId)
+          dbIds.push(dbId)
+        }
+      })
+    }
+
+    if (!targetStableId) {
+      return dbIds
+    }
+
+    addDbIds(await searchModelDbIds(model, targetStableId))
+    addDbIds(await searchModelDbIds(model, `[${targetStableId}]`))
+    addDbIds(findStableElementDbIdsInTree(model, targetStableId))
+
+    return dbIds
+  }
+
   function stableElementIdsMatch(left, right) {
     const leftText = normalizeText(left)
     const rightText = normalizeText(right)
     return Boolean(leftText && rightText && leftText === rightText)
+  }
+
+  function isStablePipeTargetInfo(info, stableElementId) {
+    if (!stableElementIdsMatch(stableElementId, info?.stableElementId)) {
+      return false
+    }
+
+    if (isRecordablePipeInfo(info)) {
+      return true
+    }
+
+    return Boolean(info && looksLikePipe(info.propertyMap, info.name) && !info.isNonPhysicalLine)
   }
 
   async function getPipeRecordInfoSafe(model, dbId) {
@@ -697,11 +769,12 @@
       ? await getPipeRecordInfoSafe(model, savedDbId)
       : null
 
-    if (isRecordablePipeInfo(savedInfo)) {
-      if (
-        !stableElementId ||
-        stableElementIdsMatch(stableElementId, savedInfo.stableElementId)
-      ) {
+    if (savedInfo) {
+      if (!stableElementId && isRecordablePipeInfo(savedInfo)) {
+        return { dbId: savedDbId, info: savedInfo, repaired: false }
+      }
+
+      if (isStablePipeTargetInfo(savedInfo, stableElementId)) {
         return { dbId: savedDbId, info: savedInfo, repaired: false }
       }
     }
@@ -710,13 +783,10 @@
       return null
     }
 
-    const candidateDbIds = await searchModelDbIds(model, stableElementId)
+    const candidateDbIds = await findStableElementDbIds(model, stableElementId)
     for (const candidateDbId of candidateDbIds) {
       const candidateInfo = await getPipeRecordInfoSafe(model, candidateDbId)
-      if (
-        isRecordablePipeInfo(candidateInfo) &&
-        stableElementIdsMatch(stableElementId, candidateInfo.stableElementId)
-      ) {
+      if (isStablePipeTargetInfo(candidateInfo, stableElementId)) {
         return {
           dbId: candidateDbId,
           info: candidateInfo,
@@ -807,10 +877,7 @@
     }
 
     const info = await getPipeRecordInfoSafe(model, dbId)
-    if (
-      !isRecordablePipeInfo(info) ||
-      !stableElementIdsMatch(stableElementId, info.stableElementId)
-    ) {
+    if (!isStablePipeTargetInfo(info, stableElementId)) {
       return null
     }
 
@@ -2396,7 +2463,13 @@
     const propertyMap = getPropertyMap(properties.properties)
     const name = normalizeText(properties.name || getNodeName(model, normalizedDbId) || TEXT.unnamed)
     const externalId = normalizeText(properties.externalId)
-    const stableElementId = extractBracketedElementId(name) || externalId
+    const propertyElementId = getPropertyEntryText(
+      findPropertyValue(propertyMap, ['element id', 'revit id', '\u5143\u4ef6 id', '\u6784\u4ef6 id']),
+    )
+    const stableElementId =
+      extractBracketedElementId(name) ||
+      (propertyElementId && propertyElementId !== String(normalizedDbId) ? propertyElementId : '') ||
+      externalId
     const lengthProperty = findPropertyValue(propertyMap, LENGTH_KEYS)
     const lengthMeters = parseLengthMeters(lengthProperty)
     const isNonPhysicalLine = looksLikeNonPhysicalLine(propertyMap, name)
