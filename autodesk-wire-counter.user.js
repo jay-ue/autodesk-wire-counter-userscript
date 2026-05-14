@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.6
+// @version      0.7.7
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.6'
+  const SCRIPT_VERSION = '0.7.7'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -950,6 +950,21 @@
     }
 
     return row
+  }
+
+  async function findRecordedRowForHoverDbId(model, dbId) {
+    const directRow = await findRecordedRowForDbId(model, dbId)
+    if (directRow) {
+      return directRow
+    }
+
+    const info = await getPipeRecordInfoSafe(model, dbId)
+    const stableElementId = normalizeText(info?.stableElementId)
+    if (!stableElementId || !isStablePipeTargetInfo(info, stableElementId)) {
+      return null
+    }
+
+    return findRecordedRowByStableElementId(model, stableElementId)
   }
 
   function removeDuplicateRecordedRows() {
@@ -2930,18 +2945,12 @@
         return
       }
 
-      const row = state.rows.get(getRowKey(model, dbId)) || null
-      if (!row) {
-        hideHoverTooltip()
-        return
-      }
-
       if (!hasWirePixelNearPointer(viewer, event)) {
         hideHoverTooltip()
         return
       }
 
-      const verifiedRow = await findRecordedRowForDbId(model, dbId)
+      const verifiedRow = await findRecordedRowForHoverDbId(model, dbId)
       if (!verifiedRow) {
         hideHoverTooltip()
         return
