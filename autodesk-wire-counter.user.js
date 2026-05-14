@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.5
+// @version      0.7.6
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.5'
+  const SCRIPT_VERSION = '0.7.6'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -146,6 +146,7 @@
     rows: new Map(),
     collapsedCircuits: new Set(),
     attachedViewerIds: new WeakSet(),
+    stableElementLookupCache: new WeakMap(),
   }
 
   function getStorageKey() {
@@ -156,6 +157,7 @@
     return {
       schema: 'autodesk-wire-counter-project',
       version: '1.0',
+      scriptVersion: SCRIPT_VERSION,
       savedAt: new Date().toISOString(),
       sourceUrl: pageWindow.location.href,
       currentCircuitCode: state.currentCircuitCode,
@@ -650,6 +652,16 @@
     return models.length === 1 ? models[0] : null
   }
 
+  function rowBelongsToModel(row, model) {
+    if (!row || !model) {
+      return false
+    }
+
+    const rowModelId = normalizeText(row.modelId)
+    const modelId = getModelId(model)
+    return !rowModelId || rowModelId === modelId || findModelById(rowModelId) === model
+  }
+
   async function searchModelDbIds(model, query) {
     const searchText = normalizeText(query)
     if (!model || !searchText || typeof model.search !== 'function') {
@@ -728,9 +740,22 @@
       return dbIds
     }
 
+    const cache = state.stableElementLookupCache.get(model) || new Map()
+    if (!state.stableElementLookupCache.has(model)) {
+      state.stableElementLookupCache.set(model, cache)
+    }
+
+    if (cache.has(targetStableId)) {
+      return cache.get(targetStableId).slice()
+    }
+
     addDbIds(await searchModelDbIds(model, targetStableId))
     addDbIds(await searchModelDbIds(model, `[${targetStableId}]`))
     addDbIds(findStableElementDbIdsInTree(model, targetStableId))
+
+    if (dbIds.length > 0) {
+      cache.set(targetStableId, dbIds.slice())
+    }
 
     return dbIds
   }
@@ -760,6 +785,49 @@
       console.warn('Failed to read wire counter object while resolving row', error)
       return null
     }
+  }
+
+  function findRecordedRowByStableElementId(model, stableElementId) {
+    const targetStableId = normalizeText(stableElementId)
+    if (!model || !targetStableId) {
+      return null
+    }
+
+    return (
+      Array.from(state.rows.values()).find(
+        (row) =>
+          stableElementIdsMatch(getRowStableElementId(row), targetStableId) &&
+          rowBelongsToModel(row, model),
+      ) || null
+    )
+  }
+
+  async function moveConflictingRowAway(model, dbId, stableElementId, deferUi) {
+    const conflictingRow = state.rows.get(getRowKey(model, dbId)) || null
+    const conflictingStableId = getRowStableElementId(conflictingRow)
+
+    if (
+      !conflictingRow ||
+      !conflictingStableId ||
+      !stableElementId ||
+      stableElementIdsMatch(conflictingStableId, stableElementId)
+    ) {
+      return true
+    }
+
+    const resolvedConflict = await resolveRowTarget(conflictingRow, model)
+    if (resolvedConflict && resolvedConflict.dbId !== dbId) {
+      syncRowTarget(conflictingRow, model, resolvedConflict.dbId, resolvedConflict.info)
+      return true
+    }
+
+    if (!deferUi) {
+      setStatus(
+        `当前 dbId ${dbId} 被旧记录 ${conflictingStableId} 占用，未覆盖；请先定位那条旧记录或清理后再记录`,
+      )
+    }
+
+    return false
   }
 
   async function resolveRowTarget(row, model) {
@@ -2531,9 +2599,21 @@
       const lengthMeters = recordInfo.lengthMeters
       const lengthSourceText = recordInfo.lengthSourceText
       const key = getRowKey(model, rawDbId)
-      const existing = state.rows.get(key)
+      const canUseCurrentKey = await moveConflictingRowAway(
+        model,
+        rawDbId,
+        stableElementId,
+        deferUi,
+      )
+      if (!canUseCurrentKey) {
+        return null
+      }
+
+      const existing = state.rows.get(key) || findRecordedRowByStableElementId(model, stableElementId)
 
       if (existing) {
+        const previousKey = existing.key
+        syncRowTarget(existing, model, rawDbId, recordInfo)
         existing.level = normalizeText(existing.level) || level
         existing.pipeModel = normalizeText(existing.pipeModel) || pipeModel
         existing.pipeSize = normalizeText(existing.pipeSize) || pipeSize
@@ -2549,7 +2629,9 @@
         renderRows()
         activateRow(existing)
         setStatus(
-          `\u5df2\u7edf\u8ba1\u8fc7\uff1a${normalizeText(existing.identifier) || rawDbId}\uff0c\u5df2\u9009\u4e2d\u5bf9\u5e94\u884c`,
+          previousKey === existing.key
+            ? `\u5df2\u7edf\u8ba1\u8fc7\uff1a${normalizeText(existing.identifier) || rawDbId}\uff0c\u5df2\u9009\u4e2d\u5bf9\u5e94\u884c`
+            : `已按稳定构件号更新旧记录：${stableElementId || normalizeText(existing.identifier) || rawDbId}`,
         )
         return existing
       }
