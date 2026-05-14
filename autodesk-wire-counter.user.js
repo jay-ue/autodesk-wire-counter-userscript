@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.2
+// @version      0.7.3
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.2'
+  const SCRIPT_VERSION = '0.7.3'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -143,7 +143,6 @@
     pendingCaptureKeys: new Set(),
     persistTimer: 0,
     suppressSelectionCaptureUntil: 0,
-    cleanupRunning: false,
     rows: new Map(),
     collapsedCircuits: new Set(),
     attachedViewerIds: new WeakSet(),
@@ -273,6 +272,12 @@
 
   function getDisplayName(row) {
     return normalizeText(row.customName) || normalizeText(row.name) || TEXT.unnamed
+  }
+
+  function getIdentifierDisplay(row) {
+    const identifier = normalizeText(row.identifier) || '-'
+    const dbId = Number.isInteger(Number(row.dbId)) ? String(row.dbId) : '-'
+    return `${identifier} / dbId ${dbId}`
   }
 
   function setStatus(message) {
@@ -619,26 +624,6 @@
     return models.length === 1 ? models[0] : null
   }
 
-  function updateRowModelTarget(row, model, dbId) {
-    const nextDbId = Number(dbId)
-    if (!row || !model || !Number.isInteger(nextDbId)) {
-      return row
-    }
-
-    const previousKey = row.key
-    const nextKey = getRowKey(model, nextDbId)
-    row.modelId = getModelId(model)
-    row.dbId = nextDbId
-    row.key = nextKey
-
-    if (previousKey !== nextKey) {
-      state.rows.delete(previousKey)
-      state.rows.set(nextKey, row)
-    }
-
-    return row
-  }
-
   function focusRowModel(row) {
     if (!state.viewer || !row) {
       return
@@ -677,28 +662,7 @@
       return null
     }
 
-    let currentId = dbId
-    const tree = getInstanceTree(model)
-
-    for (let index = 0; index < 8; index += 1) {
-      const row = state.rows.get(getRowKey(model, currentId))
-      if (row) {
-        return row
-      }
-
-      if (!tree || typeof tree.getNodeParentId !== 'function') {
-        return null
-      }
-
-      const parentId = tree.getNodeParentId(currentId)
-      if (!Number.isInteger(parentId) || parentId < 0 || parentId === currentId) {
-        return null
-      }
-
-      currentId = parentId
-    }
-
-    return null
+    return state.rows.get(getRowKey(model, dbId)) || null
   }
 
   function removeDuplicateRecordedRows() {
@@ -1206,7 +1170,7 @@
         tr.appendChild(makeCell(rowIndex + 1, 'awc-serial-cell'))
         tr.appendChild(makeCell(circuitCodeInput))
         tr.appendChild(makeCell(circuitNameInput))
-        tr.appendChild(makeCell(row.identifier))
+        tr.appendChild(makeCell(getIdentifierDisplay(row)))
         tr.appendChild(makeCell(normalizeText(row.pipeSize) || normalizeText(row.pipeModel) || '-'))
         tr.appendChild(makeCell(lengthCellContent))
         tr.appendChild(makeCell(wireModelInput))
@@ -1241,7 +1205,8 @@
       '\u5e8f\u53f7',
       '\u56de\u8def\u7f16\u53f7',
       '\u56de\u8def\u540d\u79f0',
-      '\u6a21\u578bID',
+      '\u5c5e\u6027ID',
+      'Viewer dbId',
       '\u7ba1\u9053\u5c3a\u5bf8',
       '\u539f\u59cb\u540d\u79f0',
       '\u539f\u59cb\u957f\u5ea6',
@@ -1259,6 +1224,7 @@
         normalizeText(row.circuitCode),
         normalizeText(row.circuitName),
         normalizeText(row.identifier),
+        String(row.dbId),
         normalizeText(row.pipeSize),
         normalizeText(row.name),
         normalizeText(row.lengthSourceText),
@@ -2095,7 +2061,7 @@
             <th>\u5e8f\u53f7</th>
             <th>\u56de\u8def\u7f16\u53f7</th>
             <th>\u56de\u8def\u540d\u79f0</th>
-            <th>\u6a21\u578bID</th>
+            <th>\u5c5e\u6027ID / dbId</th>
             <th>\u5c3a\u5bf8</th>
             <th>\u957f\u5ea6(m)</th>
             <th>\u5bfc\u7ebf\u578b\u53f7</th>
@@ -2301,231 +2267,6 @@
     return Boolean(info?.isPipe && info.lengthMeters != null && info.lengthMeters > 0)
   }
 
-  async function findPipeInfoInHierarchy(model, dbId) {
-    let currentId = Number(dbId)
-    const tree = getInstanceTree(model)
-    let fallbackPipeInfo = null
-
-    for (let index = 0; index < 8; index += 1) {
-      if (!Number.isInteger(currentId) || currentId < 0) {
-        return fallbackPipeInfo
-      }
-
-      const info = await getPipeRecordInfo(model, currentId)
-      if (info?.isNonPhysicalLine || info?.hasPhysicalGeometry === false) {
-        return info
-      }
-
-      if (info?.isPipe) {
-        fallbackPipeInfo = info
-        if (isRecordablePipeInfo(info)) {
-          return info
-        }
-      }
-
-      if (!tree || typeof tree.getNodeParentId !== 'function') {
-        return fallbackPipeInfo
-      }
-
-      const parentId = tree.getNodeParentId(currentId)
-      if (!Number.isInteger(parentId) || parentId < 0 || parentId === currentId) {
-        return fallbackPipeInfo
-      }
-
-      currentId = parentId
-    }
-
-    return fallbackPipeInfo
-  }
-
-  function rowMatchesPipeInfo(row, info) {
-    if (!isRecordablePipeInfo(info)) {
-      return false
-    }
-
-    const rowIdentifier = normalizeText(row.identifier)
-    const infoIdentifier = normalizeText(info.identifier)
-    if (rowIdentifier && infoIdentifier && rowIdentifier !== infoIdentifier) {
-      return false
-    }
-
-    const rowLength = toNonNegativeNumber(row.lengthMeters)
-    if (rowLength > 0 && Math.abs(rowLength - info.lengthMeters) > Math.max(0.05, rowLength * 0.08)) {
-      return false
-    }
-
-    return true
-  }
-
-  function mergePipeInfoIntoRow(row, info) {
-    if (!row || !info) {
-      return
-    }
-
-    row.identifier = normalizeText(row.identifier) || normalizeText(info.identifier)
-    row.name = normalizeText(row.name) || normalizeText(info.name)
-    row.level = normalizeText(row.level) || normalizeText(info.level)
-    row.pipeModel = normalizeText(row.pipeModel) || normalizeText(info.pipeModel)
-    row.pipeSize = normalizeText(row.pipeSize) || normalizeText(info.pipeSize)
-    row.lengthSourceText = normalizeText(row.lengthSourceText) || normalizeText(info.lengthSourceText)
-    row.lengthMeters = toNonNegativeNumber(row.lengthMeters, info.lengthMeters)
-  }
-
-  async function searchModelDbIds(model, text) {
-    const query = normalizeText(text)
-    if (!query || typeof model?.search !== 'function') {
-      return []
-    }
-
-    return await new Promise((resolve) => {
-      try {
-        model.search(
-          query,
-          (dbIds) =>
-            resolve(
-              toArray(dbIds)
-                .map((value) => Number(value))
-                .filter((value) => Number.isInteger(value) && value >= 0),
-            ),
-          () => resolve([]),
-        )
-      } catch {
-        resolve([])
-      }
-    })
-  }
-
-  async function findPipeTargetByIdentifier(model, row) {
-    const identifier = normalizeText(row.identifier)
-    if (!identifier) {
-      return null
-    }
-
-    const dbIds = await searchModelDbIds(model, identifier)
-    const seen = new Set()
-
-    for (const dbId of dbIds.slice(0, 80)) {
-      if (seen.has(dbId)) {
-        continue
-      }
-      seen.add(dbId)
-
-      const info = await findPipeInfoInHierarchy(model, dbId)
-      if (rowMatchesPipeInfo(row, info)) {
-        return info
-      }
-    }
-
-    return null
-  }
-
-  async function resolveRowFocusTarget(model, row, dbId) {
-    const directInfo = await findPipeInfoInHierarchy(model, dbId)
-    if (rowMatchesPipeInfo(row, directInfo)) {
-      mergePipeInfoIntoRow(row, directInfo)
-      return directInfo
-    }
-
-    const repairedInfo = await findPipeTargetByIdentifier(model, row)
-    if (repairedInfo) {
-      mergePipeInfoIntoRow(row, repairedInfo)
-      return repairedInfo
-    }
-
-    return null
-  }
-
-  async function cleanupRecordedRows() {
-    if (state.cleanupRunning || state.rows.size === 0) {
-      return
-    }
-
-    state.cleanupRunning = true
-    let repairedCount = 0
-    let removedCount = 0
-
-    try {
-      for (const row of Array.from(state.rows.values())) {
-        const model = findModelById(row.modelId)
-        if (!model) {
-          continue
-        }
-
-        let info = null
-        try {
-          info = await getPipeRecordInfo(model, row.dbId)
-        } catch {
-          continue
-        }
-
-        if (rowMatchesPipeInfo(row, info)) {
-          mergePipeInfoIntoRow(row, info)
-          continue
-        }
-
-        const repairedInfo = await findPipeTargetByIdentifier(model, row)
-        if (rowMatchesPipeInfo(row, repairedInfo)) {
-          updateRowModelTarget(row, repairedInfo.model, repairedInfo.dbId)
-          mergePipeInfoIntoRow(row, repairedInfo)
-          repairedCount += 1
-          continue
-        }
-
-        if (info && (info.isNonPhysicalLine || info.hasPhysicalGeometry === false || !info.isPipe)) {
-          state.rows.delete(row.key)
-          removedCount += 1
-        }
-      }
-
-      if (repairedCount > 0 || removedCount > 0) {
-        persistState()
-        renderRows()
-        setStatus(`已校验记录：修正 ${repairedCount} 条，清理细线/非线管 ${removedCount} 条`)
-      }
-    } finally {
-      state.cleanupRunning = false
-    }
-  }
-
-  async function normalizeDbId(model, dbId) {
-    const recordedRow = findRecordedRowForDbId(model, dbId)
-    if (recordedRow) {
-      return Number(recordedRow.dbId)
-    }
-
-    let currentId = dbId
-    const tree = getInstanceTree(model)
-    let fallbackPipeId = currentId
-
-    if (!tree || typeof tree.getNodeParentId !== 'function') {
-      return currentId
-    }
-
-    for (let index = 0; index < 8; index += 1) {
-      const info = await getPipeRecordInfo(model, currentId)
-
-      if (info?.isNonPhysicalLine || info?.hasPhysicalGeometry === false) {
-        return currentId
-      }
-
-      if (info?.isPipe) {
-        fallbackPipeId = currentId
-        if (isRecordablePipeInfo(info)) {
-          return currentId
-        }
-      }
-
-      const parentId = tree.getNodeParentId(currentId)
-      if (!Number.isInteger(parentId) || parentId < 0 || parentId === currentId) {
-        return fallbackPipeId
-      }
-
-      currentId = parentId
-    }
-
-    return fallbackPipeId
-  }
-
   async function captureDbId(model, dbId, options = {}) {
     const deferUi = Boolean(options.deferUi)
     const rawDbId = Number(dbId)
@@ -2541,12 +2282,11 @@
     state.pendingCaptureKeys.add(captureKey)
 
     try {
-      const normalizedDbId = await normalizeDbId(model, rawDbId)
-      const recordInfo = await getPipeRecordInfo(model, normalizedDbId)
+      const recordInfo = await getPipeRecordInfo(model, rawDbId)
 
       if (!isRecordablePipeInfo(recordInfo)) {
         if (!deferUi) {
-          setStatus(`${TEXT.notPipePrefix}${recordInfo?.name || `dbId ${normalizedDbId}`}`)
+          setStatus(`${TEXT.notPipePrefix}${recordInfo?.name || `dbId ${rawDbId}`}`)
         }
         return null
       }
@@ -2557,7 +2297,7 @@
       const pipeSize = recordInfo.pipeSize
       const lengthMeters = recordInfo.lengthMeters
       const lengthSourceText = recordInfo.lengthSourceText
-      const key = getRowKey(model, normalizedDbId)
+      const key = getRowKey(model, rawDbId)
       const existing = state.rows.get(key)
 
       if (existing) {
@@ -2574,7 +2314,7 @@
         renderRows()
         activateRow(existing)
         setStatus(
-          `\u5df2\u7edf\u8ba1\u8fc7\uff1a${normalizeText(existing.identifier) || normalizedDbId}\uff0c\u5df2\u9009\u4e2d\u5bf9\u5e94\u884c`,
+          `\u5df2\u7edf\u8ba1\u8fc7\uff1a${normalizeText(existing.identifier) || rawDbId}\uff0c\u5df2\u9009\u4e2d\u5bf9\u5e94\u884c`,
         )
         return existing
       }
@@ -2585,7 +2325,7 @@
       const nextRow = {
         key,
         modelId: getModelId(model),
-        dbId: normalizedDbId,
+        dbId: rawDbId,
         createdAt: Date.now(),
         orderIndex: getNextOrderIndexForCircuit(circuitCode, circuitName),
         identifier,
