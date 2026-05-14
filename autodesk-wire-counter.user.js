@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.3
+// @version      0.7.4
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.3'
+  const SCRIPT_VERSION = '0.7.4'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -211,6 +211,27 @@
     return String(value ?? '').trim()
   }
 
+  function extractBracketedElementId(text) {
+    const matches = []
+    normalizeText(text).replace(/\[([^\]]+)\]/g, (_, value) => {
+      const id = normalizeText(value)
+      if (id) {
+        matches.push(id)
+      }
+      return ''
+    })
+    return matches.length ? matches[matches.length - 1] : ''
+  }
+
+  function getRowStableElementId(row) {
+    return (
+      normalizeText(row?.stableElementId) ||
+      normalizeText(row?.revitElementId) ||
+      extractBracketedElementId(row?.name) ||
+      normalizeText(row?.externalId)
+    )
+  }
+
   function formatNumber(value) {
     return Number.isFinite(value) ? value.toFixed(2) : '0.00'
   }
@@ -263,6 +284,8 @@
       pipeSize: normalizeText(row.pipeSize),
       lengthMeters,
       lengthSourceText: normalizeText(row.lengthSourceText),
+      externalId: normalizeText(row.externalId),
+      stableElementId: getRowStableElementId(row),
       wireModel: normalizeText(row.wireModel) || DEFAULT_WIRE_MODEL,
       wireCount,
       circuitCode: normalizeText(row.circuitCode),
@@ -277,7 +300,10 @@
   function getIdentifierDisplay(row) {
     const identifier = normalizeText(row.identifier) || '-'
     const dbId = Number.isInteger(Number(row.dbId)) ? String(row.dbId) : '-'
-    return `${identifier} / dbId ${dbId}`
+    const stableElementId = getRowStableElementId(row)
+    return stableElementId
+      ? `${identifier} / dbId ${dbId} / 元件 ${stableElementId}`
+      : `${identifier} / dbId ${dbId}`
   }
 
   function setStatus(message) {
@@ -624,7 +650,110 @@
     return models.length === 1 ? models[0] : null
   }
 
-  function focusRowModel(row) {
+  async function searchModelDbIds(model, query) {
+    const searchText = normalizeText(query)
+    if (!model || !searchText || typeof model.search !== 'function') {
+      return []
+    }
+
+    return await new Promise((resolve) => {
+      try {
+        model.search(
+          searchText,
+          (dbIds) =>
+            resolve(
+              toArray(dbIds)
+                .map(Number)
+                .filter((dbId) => Number.isInteger(dbId) && dbId >= 0),
+            ),
+          () => resolve([]),
+        )
+      } catch (error) {
+        console.warn('Failed to search Autodesk model', error)
+        resolve([])
+      }
+    })
+  }
+
+  function stableElementIdsMatch(left, right) {
+    const leftText = normalizeText(left)
+    const rightText = normalizeText(right)
+    return Boolean(leftText && rightText && leftText === rightText)
+  }
+
+  async function getPipeRecordInfoSafe(model, dbId) {
+    try {
+      return await getPipeRecordInfo(model, dbId)
+    } catch (error) {
+      console.warn('Failed to read wire counter object while resolving row', error)
+      return null
+    }
+  }
+
+  async function resolveRowTarget(row, model) {
+    const savedDbId = Number(row?.dbId)
+    const stableElementId = getRowStableElementId(row)
+    const savedInfo = Number.isInteger(savedDbId)
+      ? await getPipeRecordInfoSafe(model, savedDbId)
+      : null
+
+    if (isRecordablePipeInfo(savedInfo)) {
+      if (
+        !stableElementId ||
+        stableElementIdsMatch(stableElementId, savedInfo.stableElementId)
+      ) {
+        return { dbId: savedDbId, info: savedInfo, repaired: false }
+      }
+    }
+
+    if (!stableElementId) {
+      return null
+    }
+
+    const candidateDbIds = await searchModelDbIds(model, stableElementId)
+    for (const candidateDbId of candidateDbIds) {
+      const candidateInfo = await getPipeRecordInfoSafe(model, candidateDbId)
+      if (
+        isRecordablePipeInfo(candidateInfo) &&
+        stableElementIdsMatch(stableElementId, candidateInfo.stableElementId)
+      ) {
+        return {
+          dbId: candidateDbId,
+          info: candidateInfo,
+          repaired: candidateDbId !== savedDbId,
+        }
+      }
+    }
+
+    return null
+  }
+
+  function syncRowTarget(row, model, dbId, info) {
+    const oldKey = row.key
+    const stableElementId = getRowStableElementId(row) || normalizeText(info?.stableElementId)
+
+    row.modelId = getModelId(model)
+    row.dbId = dbId
+    row.key = getRowKey(model, dbId)
+    row.identifier = normalizeText(info?.identifier) || normalizeText(row.identifier) || String(dbId)
+    row.name = normalizeText(info?.name) || normalizeText(row.name)
+    row.externalId = normalizeText(info?.externalId) || normalizeText(row.externalId)
+    row.stableElementId = stableElementId
+    row.level = normalizeText(row.level) || normalizeText(info?.level)
+    row.pipeModel = normalizeText(row.pipeModel) || normalizeText(info?.pipeModel)
+    row.pipeSize = normalizeText(row.pipeSize) || normalizeText(info?.pipeSize)
+    row.lengthSourceText = normalizeText(row.lengthSourceText) || normalizeText(info?.lengthSourceText)
+    row.lengthMeters = Number(row.lengthMeters) || Number(info?.lengthMeters) || 0
+
+    if (oldKey !== row.key) {
+      state.rows.delete(oldKey)
+    }
+
+    state.rows.set(row.key, row)
+    state.activeRowKey = row.key
+  }
+
+  async function focusRowModel(row) {
     if (!state.viewer || !row) {
       return
     }
@@ -632,37 +761,60 @@
     activateRow(row, false)
 
     const model = findModelById(row.modelId)
-    const dbId = Number(row.dbId)
 
     if (!model) {
       setStatus(`无法定位模型：${normalizeText(row.identifier) || row.dbId}`)
       return
     }
 
-    if (!Number.isInteger(dbId)) {
-      setStatus(`无法定位构件：${normalizeText(row.identifier) || row.dbId}`)
+    const resolved = await resolveRowTarget(row, model)
+    if (!resolved) {
+      const stableElementId = getRowStableElementId(row)
+      const idText = stableElementId
+        ? `稳定构件 ${stableElementId}（旧 dbId ${normalizeText(row.dbId) || '-'}）`
+        : normalizeText(row.identifier) || normalizeText(row.dbId) || '-'
+      setStatus(`定位失败：${idText}`)
       return
     }
 
     try {
+      syncRowTarget(row, model, resolved.dbId, resolved.info)
       state.suppressSelectionCaptureUntil = Date.now() + 800
-      state.viewer.select([dbId], model)
+      state.viewer.select([resolved.dbId], model)
       if (typeof state.viewer.fitToView === 'function') {
-        state.viewer.fitToView([dbId], model)
+        state.viewer.fitToView([resolved.dbId], model)
       }
-      setStatus(`\u5df2\u5b9a\u4f4d\uff1a${normalizeText(row.identifier) || dbId}`)
+      persistState()
+      renderRows()
+      const stableElementId = getRowStableElementId(row)
+      const statusId = stableElementId || normalizeText(row.identifier) || resolved.dbId
+      setStatus(resolved.repaired ? `已按稳定构件号重新定位：${statusId}` : `已定位：${statusId}`)
     } catch (error) {
       console.warn('Failed to focus wire counter row', error)
-      setStatus(`定位失败：${normalizeText(row.identifier) || dbId}`)
+      setStatus(`定位失败：${normalizeText(row.identifier) || resolved.dbId}`)
     }
   }
 
-  function findRecordedRowForDbId(model, dbId) {
+  async function findRecordedRowForDbId(model, dbId) {
     if (!model || !Number.isInteger(dbId)) {
       return null
     }
 
-    return state.rows.get(getRowKey(model, dbId)) || null
+    const row = state.rows.get(getRowKey(model, dbId)) || null
+    const stableElementId = getRowStableElementId(row)
+    if (!row || !stableElementId) {
+      return row
+    }
+
+    const info = await getPipeRecordInfoSafe(model, dbId)
+    if (
+      !isRecordablePipeInfo(info) ||
+      !stableElementIdsMatch(stableElementId, info.stableElementId)
+    ) {
+      return null
+    }
+
+    return row
   }
 
   function removeDuplicateRecordedRows() {
@@ -1207,6 +1359,7 @@
       '\u56de\u8def\u540d\u79f0',
       '\u5c5e\u6027ID',
       'Viewer dbId',
+      '稳定构件ID',
       '\u7ba1\u9053\u5c3a\u5bf8',
       '\u539f\u59cb\u540d\u79f0',
       '\u539f\u59cb\u957f\u5ea6',
@@ -1225,6 +1378,7 @@
         normalizeText(row.circuitName),
         normalizeText(row.identifier),
         String(row.dbId),
+        getRowStableElementId(row),
         normalizeText(row.pipeSize),
         normalizeText(row.name),
         normalizeText(row.lengthSourceText),
@@ -2061,7 +2215,7 @@
             <th>\u5e8f\u53f7</th>
             <th>\u56de\u8def\u7f16\u53f7</th>
             <th>\u56de\u8def\u540d\u79f0</th>
-            <th>\u5c5e\u6027ID / dbId</th>
+            <th>\u5c5e\u6027ID / dbId / \u5143\u4ef6</th>
             <th>\u5c3a\u5bf8</th>
             <th>\u957f\u5ea6(m)</th>
             <th>\u5bfc\u7ebf\u578b\u53f7</th>
@@ -2241,6 +2395,8 @@
     const properties = await getProperties(model, normalizedDbId)
     const propertyMap = getPropertyMap(properties.properties)
     const name = normalizeText(properties.name || getNodeName(model, normalizedDbId) || TEXT.unnamed)
+    const externalId = normalizeText(properties.externalId)
+    const stableElementId = extractBracketedElementId(name) || externalId
     const lengthProperty = findPropertyValue(propertyMap, LENGTH_KEYS)
     const lengthMeters = parseLengthMeters(lengthProperty)
     const isNonPhysicalLine = looksLikeNonPhysicalLine(propertyMap, name)
@@ -2255,6 +2411,8 @@
       isNonPhysicalLine,
       hasPhysicalGeometry,
       identifier: getIdentifierFromProperties(propertyMap, normalizedDbId),
+      externalId,
+      stableElementId,
       level: getPropertyEntryText(findPropertyValue(propertyMap, LEVEL_KEYS)),
       pipeModel: getPropertyEntryText(findPropertyValue(propertyMap, MODEL_KEYS)),
       pipeSize: buildPropertySourceText(findPropertyValue(propertyMap, SIZE_KEYS)),
@@ -2292,6 +2450,8 @@
       }
 
       const identifier = recordInfo.identifier
+      const externalId = recordInfo.externalId
+      const stableElementId = recordInfo.stableElementId
       const level = recordInfo.level
       const pipeModel = recordInfo.pipeModel
       const pipeSize = recordInfo.pipeSize
@@ -2305,6 +2465,8 @@
         existing.pipeModel = normalizeText(existing.pipeModel) || pipeModel
         existing.pipeSize = normalizeText(existing.pipeSize) || pipeSize
         existing.lengthSourceText = normalizeText(existing.lengthSourceText) || lengthSourceText
+        existing.externalId = normalizeText(existing.externalId) || externalId
+        existing.stableElementId = getRowStableElementId(existing) || stableElementId
         existing.lengthMeters = Number(existing.lengthMeters) || lengthMeters
         if (deferUi) {
           return existing
@@ -2336,6 +2498,8 @@
         pipeSize,
         lengthMeters,
         lengthSourceText,
+        externalId,
+        stableElementId,
         wireModel: state.defaultWireModel,
         wireCount: state.defaultWireCount,
         circuitCode,
@@ -2587,7 +2751,7 @@
         ? (frameId) => pageWindow.cancelAnimationFrame(frameId)
         : (frameId) => pageWindow.clearTimeout(frameId)
 
-    const runHoverHitTest = () => {
+    const runHoverHitTest = async () => {
       hoverFrameId = 0
 
       const event = pendingHoverEvent
@@ -2611,7 +2775,7 @@
         return
       }
 
-      const row = findRecordedRowForDbId(model, dbId)
+      const row = state.rows.get(getRowKey(model, dbId)) || null
       if (!row) {
         hideHoverTooltip()
         return
@@ -2622,7 +2786,13 @@
         return
       }
 
-      showHoverTooltip(row, event)
+      const verifiedRow = await findRecordedRowForDbId(model, dbId)
+      if (!verifiedRow) {
+        hideHoverTooltip()
+        return
+      }
+
+      showHoverTooltip(verifiedRow, event)
     }
 
     target.addEventListener(
