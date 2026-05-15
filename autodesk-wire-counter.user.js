@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.8.0
+// @version      0.8.1
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.8.0'
+  const SCRIPT_VERSION = '0.8.1'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -133,6 +133,10 @@
     summaryEl: null,
     totalsEl: null,
     tbodyEl: null,
+    circuitCodeInput: null,
+    circuitNameInput: null,
+    defaultWireModelInput: null,
+    defaultWireCountInput: null,
     currentCircuitCode: '',
     currentCircuitName: '',
     defaultWireModel: DEFAULT_WIRE_MODEL,
@@ -205,6 +209,7 @@
     )
     removeDuplicateRecordedRows()
     normalizeAllRowOrder()
+    syncToolbarInputs()
   }
 
   function toArray(value) {
@@ -368,6 +373,47 @@
       item.textContent = line
       state.reportEl.appendChild(item)
     })
+  }
+
+  function syncToolbarInputs() {
+    if (state.circuitCodeInput) {
+      state.circuitCodeInput.value = state.currentCircuitCode
+    }
+
+    if (state.circuitNameInput) {
+      state.circuitNameInput.value = state.currentCircuitName
+    }
+
+    if (state.defaultWireModelInput) {
+      state.defaultWireModelInput.value = state.defaultWireModel
+    }
+
+    if (state.defaultWireCountInput) {
+      state.defaultWireCountInput.value = String(state.defaultWireCount)
+    }
+  }
+
+  function applyRowSettingsToToolbar(row, persist = true) {
+    if (!row) {
+      return
+    }
+
+    state.currentCircuitCode = normalizeText(row.circuitCode)
+    state.currentCircuitName = normalizeText(row.circuitName)
+    state.defaultWireModel = normalizeText(row.wireModel) || DEFAULT_WIRE_MODEL
+    state.defaultWireCount = toNonNegativeNumber(row.wireCount, DEFAULT_WIRE_COUNT)
+
+    syncToolbarInputs()
+
+    if (persist) {
+      persistState()
+    }
+  }
+
+  function applyActiveRowSettingsToToolbar(row) {
+    if (row?.key === state.activeRowKey) {
+      applyRowSettingsToToolbar(row)
+    }
   }
 
   function getDefaultPanelPosition() {
@@ -680,6 +726,7 @@
     }
 
     state.activeRowKey = row.key
+    applyRowSettingsToToolbar(row)
     const circuitKey = getCircuitKey(row)
     if (state.collapsedCircuits.has(circuitKey)) {
       state.collapsedCircuits.delete(circuitKey)
@@ -1522,6 +1569,9 @@
 
           focusRowModel(row)
         })
+        tr.addEventListener('focusin', () => {
+          activateRow(row, false)
+        })
         tr.addEventListener('dragstart', (event) => {
           const target = event.target
           if (target instanceof HTMLElement && target.closest('button, input, textarea, select, a')) {
@@ -1566,6 +1616,7 @@
           row.circuitCode = circuitCodeInput.value.trim()
           renderSummary()
           refreshCircuitSummaryRows()
+          applyActiveRowSettingsToToolbar(row)
           persistState()
         })
         circuitCodeInput.addEventListener('change', renderRows)
@@ -1575,6 +1626,7 @@
           row.circuitName = circuitNameInput.value.trim()
           renderSummary()
           refreshCircuitSummaryRows()
+          applyActiveRowSettingsToToolbar(row)
           persistState()
         })
         circuitNameInput.addEventListener('change', renderRows)
@@ -1582,6 +1634,7 @@
         const wireModelInput = createInput(normalizeText(row.wireModel) || state.defaultWireModel)
         wireModelInput.addEventListener('input', () => {
           row.wireModel = wireModelInput.value.trim() || state.defaultWireModel
+          applyActiveRowSettingsToToolbar(row)
           persistState()
         })
 
@@ -1606,6 +1659,7 @@
           totalCell.textContent = formatNumber(row.lengthMeters * row.wireCount)
           renderSummary()
           refreshCircuitSummaryRows()
+          applyActiveRowSettingsToToolbar(row)
           persistState()
         })
 
@@ -2566,6 +2620,10 @@
     state.summaryEl = head.querySelector('.awc-summary')
     state.totalsEl = totals
     state.tbodyEl = tableWrap.querySelector('tbody')
+    state.circuitCodeInput = circuitCodeInput
+    state.circuitNameInput = circuitNameInput
+    state.defaultWireModelInput = wireModelInput
+    state.defaultWireCountInput = wireCountInput
     head.querySelector('.awc-minimize-button')?.addEventListener('click', () => {
       setMinimized(true)
     })
@@ -2576,6 +2634,7 @@
     ensureHoverTooltip()
     installPanelDrag()
     installPanelResize()
+    syncToolbarInputs()
     renderRows()
     setStatus(TEXT.waitingViewer)
     setMinimized(state.isMinimized, false)
