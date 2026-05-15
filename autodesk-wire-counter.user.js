@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.7
+// @version      0.7.8
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.7'
+  const SCRIPT_VERSION = '0.7.8'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -300,12 +300,15 @@
   }
 
   function getIdentifierDisplay(row) {
+    return getRowStableElementId(row) || normalizeText(row.identifier) || String(row.dbId || '-')
+  }
+
+  function getIdentifierDebugText(row) {
+    const stableElementId = getRowStableElementId(row) || '-'
     const identifier = normalizeText(row.identifier) || '-'
     const dbId = Number.isInteger(Number(row.dbId)) ? String(row.dbId) : '-'
-    const stableElementId = getRowStableElementId(row)
-    return stableElementId
-      ? `${identifier} / dbId ${dbId} / 元件 ${stableElementId}`
-      : `${identifier} / dbId ${dbId}`
+    const legacyDbId = normalizeText(row.legacyDbId) || '-'
+    return `构件ID：${stableElementId}；属性ID：${identifier}；当前 dbId：${dbId}；旧 dbId：${legacyDbId}`
   }
 
   function setStatus(message) {
@@ -1469,10 +1472,13 @@
           renderRows()
         })
 
+        const idCell = makeCell(getIdentifierDisplay(row))
+        idCell.title = getIdentifierDebugText(row)
+
         tr.appendChild(makeCell(rowIndex + 1, 'awc-serial-cell'))
         tr.appendChild(makeCell(circuitCodeInput))
         tr.appendChild(makeCell(circuitNameInput))
-        tr.appendChild(makeCell(getIdentifierDisplay(row)))
+        tr.appendChild(idCell)
         tr.appendChild(makeCell(normalizeText(row.pipeSize) || normalizeText(row.pipeModel) || '-'))
         tr.appendChild(makeCell(lengthCellContent))
         tr.appendChild(makeCell(wireModelInput))
@@ -2365,7 +2371,7 @@
             <th>\u5e8f\u53f7</th>
             <th>\u56de\u8def\u7f16\u53f7</th>
             <th>\u56de\u8def\u540d\u79f0</th>
-            <th>\u5c5e\u6027ID / dbId / \u5143\u4ef6</th>
+            <th>\u6784\u4ef6ID</th>
             <th>\u5c3a\u5bf8</th>
             <th>\u957f\u5ea6(m)</th>
             <th>\u5bfc\u7ebf\u578b\u53f7</th>
