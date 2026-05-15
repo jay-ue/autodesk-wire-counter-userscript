@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.8
+// @version      0.7.9
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.8'
+  const SCRIPT_VERSION = '0.7.9'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -249,23 +249,58 @@
 
   function parseRowKey(key) {
     const text = normalizeText(key)
+    const parts = text.split(':')
+    if (parts.length >= 3 && parts[parts.length - 2] === 'element') {
+      return {
+        modelId: parts.slice(0, -2).join(':'),
+        dbId: null,
+        stableElementId: parts[parts.length - 1],
+      }
+    }
+
+    if (parts.length >= 3 && parts[parts.length - 2] === 'dbid') {
+      const dbId = Number(parts[parts.length - 1])
+      return {
+        modelId: parts.slice(0, -2).join(':'),
+        dbId: Number.isInteger(dbId) ? dbId : null,
+        stableElementId: '',
+      }
+    }
+
     const separatorIndex = text.lastIndexOf(':')
     if (separatorIndex <= 0) {
-      return { modelId: '', dbId: null }
+      return { modelId: '', dbId: null, stableElementId: '' }
     }
 
     const dbId = Number(text.slice(separatorIndex + 1))
     return {
       modelId: text.slice(0, separatorIndex),
       dbId: Number.isInteger(dbId) ? dbId : null,
+      stableElementId: '',
     }
+  }
+
+  function buildRowKey(modelId, stableElementId, dbId) {
+    const normalizedModelId = normalizeText(modelId) || 'default-model'
+    const normalizedStableId = normalizeText(stableElementId)
+
+    if (normalizedStableId) {
+      return `${normalizedModelId}:element:${normalizedStableId}`
+    }
+
+    return `${normalizedModelId}:dbid:${String(dbId)}`
+  }
+
+  function getCaptureKey(model, dbId) {
+    return `${getModelId(model)}:capture:${String(dbId)}`
   }
 
   function normalizeRow(row, index = 0) {
     const keyParts = parseRowKey(row.key)
     const modelId = normalizeText(row.modelId) || keyParts.modelId || 'default-model'
     const dbId = Math.trunc(toSafeNumber(row.dbId, keyParts.dbId ?? index + 1))
-    const key = `${modelId}:${String(dbId)}`
+    const stableElementId = getRowStableElementId(row) || normalizeText(keyParts.stableElementId)
+    const key = buildRowKey(modelId, stableElementId, dbId)
     const lengthMeters = toNonNegativeNumber(row.lengthMeters)
     const wireCount = toNonNegativeNumber(row.wireCount, DEFAULT_WIRE_COUNT)
     const createdAt = toSafeNumber(row.createdAt, Date.now() + index)
@@ -287,7 +322,7 @@
       lengthMeters,
       lengthSourceText: normalizeText(row.lengthSourceText),
       externalId: normalizeText(row.externalId),
-      stableElementId: getRowStableElementId(row),
+      stableElementId,
       wireModel: normalizeText(row.wireModel) || DEFAULT_WIRE_MODEL,
       wireCount,
       circuitCode: normalizeText(row.circuitCode),
@@ -598,8 +633,8 @@
     return normalizeText(model?.id || model?.guid || 'default-model')
   }
 
-  function getRowKey(model, dbId) {
-    return `${getModelId(model)}:${String(dbId)}`
+  function getRowKey(model, dbId, stableElementId = '') {
+    return buildRowKey(getModelId(model), stableElementId, dbId)
   }
 
   function findRowElement(rowKey) {
@@ -875,11 +910,11 @@
 
     row.modelId = getModelId(model)
     row.dbId = dbId
-    row.key = getRowKey(model, dbId)
     row.identifier = normalizeText(info?.identifier) || normalizeText(row.identifier) || String(dbId)
     row.name = normalizeText(info?.name) || normalizeText(row.name)
     row.externalId = normalizeText(info?.externalId) || normalizeText(row.externalId)
     row.stableElementId = stableElementId
+    row.key = getRowKey(model, dbId, stableElementId)
     row.level = normalizeText(row.level) || normalizeText(info?.level)
     row.pipeModel = normalizeText(row.pipeModel) || normalizeText(info?.pipeModel)
     row.pipeSize = normalizeText(row.pipeSize) || normalizeText(info?.pipeSize)
@@ -941,18 +976,24 @@
       return null
     }
 
-    const row = state.rows.get(getRowKey(model, dbId)) || null
-    const stableElementId = getRowStableElementId(row)
-    if (!row || !stableElementId) {
-      return row
+    const fallbackRow = state.rows.get(getRowKey(model, dbId)) || null
+    const info = await getPipeRecordInfoSafe(model, dbId)
+    const stableElementId = normalizeText(info?.stableElementId)
+
+    if (stableElementId && isStablePipeTargetInfo(info, stableElementId)) {
+      return findRecordedRowByStableElementId(model, stableElementId)
     }
 
-    const info = await getPipeRecordInfoSafe(model, dbId)
-    if (!isStablePipeTargetInfo(info, stableElementId)) {
+    if (!fallbackRow) {
       return null
     }
 
-    return row
+    const fallbackStableId = getRowStableElementId(fallbackRow)
+    if (!fallbackStableId) {
+      return fallbackRow
+    }
+
+    return isStablePipeTargetInfo(info, fallbackStableId) ? fallbackRow : null
   }
 
   async function findRecordedRowForHoverDbId(model, dbId) {
@@ -1513,9 +1554,7 @@
       '\u5e8f\u53f7',
       '\u56de\u8def\u7f16\u53f7',
       '\u56de\u8def\u540d\u79f0',
-      '\u5c5e\u6027ID',
-      'Viewer dbId',
-      '稳定构件ID',
+      '\u6784\u4ef6ID',
       '\u7ba1\u9053\u5c3a\u5bf8',
       '\u539f\u59cb\u540d\u79f0',
       '\u539f\u59cb\u957f\u5ea6',
@@ -1532,8 +1571,6 @@
         String(rowIndex + 1),
         normalizeText(row.circuitCode),
         normalizeText(row.circuitName),
-        normalizeText(row.identifier),
-        String(row.dbId),
         getRowStableElementId(row),
         normalizeText(row.pipeSize),
         normalizeText(row.name),
@@ -2212,7 +2249,11 @@
       .join(' / ')
 
     addTooltipLine(tooltip, '回路', circuitText || TEXT.unnamedCircuit)
-    addTooltipLine(tooltip, '编号', normalizeText(row.identifier) || String(row.dbId))
+    addTooltipLine(
+      tooltip,
+      '构件ID',
+      getRowStableElementId(row) || normalizeText(row.identifier) || String(row.dbId),
+    )
     addTooltipLine(tooltip, '尺寸', normalizeText(row.pipeSize) || normalizeText(row.pipeModel) || '-')
     addTooltipLine(tooltip, '长度', `${formatNumber(row.lengthMeters)} m`)
     addTooltipLine(tooltip, '导线', `${normalizeText(row.wireModel) || DEFAULT_WIRE_MODEL} × ${row.wireCount} 根`)
@@ -2594,7 +2635,7 @@
       return null
     }
 
-    const captureKey = getRowKey(model, rawDbId)
+    const captureKey = getCaptureKey(model, rawDbId)
     if (state.pendingCaptureKeys.has(captureKey)) {
       return null
     }
@@ -2619,7 +2660,7 @@
       const pipeSize = recordInfo.pipeSize
       const lengthMeters = recordInfo.lengthMeters
       const lengthSourceText = recordInfo.lengthSourceText
-      const key = getRowKey(model, rawDbId)
+      const key = getRowKey(model, rawDbId, stableElementId)
       const canUseCurrentKey = await moveConflictingRowAway(
         model,
         rawDbId,
@@ -2717,7 +2758,7 @@
         continue
       }
 
-      const key = getRowKey(pair.model, rawDbId)
+      const key = getCaptureKey(pair.model, rawDbId)
       if (seen.has(key)) {
         continue
       }
