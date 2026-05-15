@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodesk Viewer Wire Counter
 // @namespace    codex.local
-// @version      0.7.9
+// @version      0.8.0
 // @description  Click conduits/pipes in viewer.autodesk.com, assign circuit and wire settings, then export a report.
 // @match        https://viewer.autodesk.com/*
 // @updateURL    https://raw.githubusercontent.com/jay-ue/autodesk-wire-counter-userscript/main/autodesk-wire-counter.user.js
@@ -20,7 +20,7 @@
   const DEFAULT_PANEL_TOP = 88
   const DEFAULT_WIRE_MODEL = 'BV-2.5'
   const DEFAULT_WIRE_COUNT = 3
-  const SCRIPT_VERSION = '0.7.9'
+  const SCRIPT_VERSION = '0.8.0'
   const WIRE_HOVER_PIXEL_RADIUS = 3
   const MIN_PHYSICAL_PIPE_THICKNESS_METERS = 0.003
 
@@ -42,6 +42,7 @@
     exportProjectButton: '\u5bfc\u51fa\u9879\u76ee',
     importProjectButton: '\u5bfc\u5165\u9879\u76ee',
     captureButton: '\u8bb0\u5f55\u5f53\u524d\u9009\u62e9',
+    calibrateButton: '校准ID',
     clearButton: '\u6e05\u7a7a',
     deleteButton: '\u5220\u9664',
     totalPipeLabel: '\u7ba1\u957f\u603b\u8ba1',
@@ -128,6 +129,7 @@
     headEl: null,
     hoverTooltipEl: null,
     statusEl: null,
+    reportEl: null,
     summaryEl: null,
     totalsEl: null,
     tbodyEl: null,
@@ -350,6 +352,22 @@
     if (state.statusEl) {
       state.statusEl.textContent = message
     }
+  }
+
+  function setReport(lines = []) {
+    if (!state.reportEl) {
+      return
+    }
+
+    const reportLines = toArray(lines).map(normalizeText).filter(Boolean)
+    state.reportEl.innerHTML = ''
+    state.reportEl.hidden = reportLines.length === 0
+
+    reportLines.forEach((line) => {
+      const item = document.createElement('div')
+      item.textContent = line
+      state.reportEl.appendChild(item)
+    })
   }
 
   function getDefaultPanelPosition() {
@@ -1011,6 +1029,92 @@
     return findRecordedRowByStableElementId(model, stableElementId)
   }
 
+  async function calibrateRecordedRows() {
+    if (!state.viewer) {
+      setStatus(TEXT.viewerMissing)
+      return
+    }
+
+    const rows = Array.from(state.rows.values())
+    if (rows.length === 0) {
+      setStatus('没有需要校准的记录。')
+      setReport([])
+      return
+    }
+
+    const previousActiveRowKey = state.activeRowKey
+    const previousActiveRow = previousActiveRowKey ? state.rows.get(previousActiveRowKey) : null
+    const previousActiveStableId = getRowStableElementId(previousActiveRow)
+    const failures = []
+    let repairedCount = 0
+    let successCount = 0
+
+    setStatus(`正在校准 ${rows.length} 条记录...`)
+    setReport([])
+
+    for (const row of rows) {
+      const stableElementId = getRowStableElementId(row)
+      if (!stableElementId) {
+        failures.push(`${normalizeText(row.identifier) || row.dbId || '-'}：缺少构件ID`)
+        continue
+      }
+
+      const model = findModelById(row.modelId)
+      if (!model) {
+        failures.push(`${stableElementId}：找不到模型`)
+        continue
+      }
+
+      const oldKey = row.key
+      const oldDbId = Number(row.dbId)
+      const resolved = await resolveRowTarget(row, model)
+
+      if (!resolved) {
+        failures.push(`${stableElementId}：当前模型未找到对应构件`)
+        continue
+      }
+
+      syncRowTarget(row, model, resolved.dbId, resolved.info)
+      successCount += 1
+
+      if (oldKey !== row.key || oldDbId !== resolved.dbId || resolved.repaired) {
+        repairedCount += 1
+      }
+    }
+
+    const restoredActiveRow = previousActiveStableId
+      ? Array.from(state.rows.values()).find((row) =>
+          stableElementIdsMatch(getRowStableElementId(row), previousActiveStableId),
+        )
+      : null
+
+    if (restoredActiveRow) {
+      state.activeRowKey = restoredActiveRow.key
+    } else if (previousActiveRowKey && state.rows.has(previousActiveRowKey)) {
+      state.activeRowKey = previousActiveRowKey
+    }
+
+    persistState()
+    renderRows()
+
+    const failedCount = failures.length
+    setStatus(
+      `校准完成：成功 ${successCount}/${rows.length} 条，更新 ${repairedCount} 条，失败 ${failedCount} 条`,
+    )
+
+    if (failedCount > 0) {
+      const shownFailures = failures.slice(0, 12)
+      const remainingCount = failedCount - shownFailures.length
+      setReport([
+        '未校准成功的构件：',
+        ...shownFailures,
+        remainingCount > 0 ? `还有 ${remainingCount} 条未显示` : '',
+      ])
+    } else {
+      setReport(['全部记录已按构件ID校准。'])
+    }
+  }
+
   function removeDuplicateRecordedRows() {
     state.rows = new Map(Array.from(state.rows.values()).map((row) => [row.key, row]))
   }
@@ -1049,6 +1153,7 @@
       restoreProjectSnapshot(JSON.parse(raw))
     } catch (error) {
       console.warn('Failed to restore wire counter state', error)
+      setReport(['本地缓存读取失败，已忽略旧缓存。'])
     }
   }
 
@@ -1665,9 +1770,11 @@
         renderRows()
         setMinimized(state.isMinimized, false)
         setStatus(`\u5df2\u5bfc\u5165\u9879\u76ee\uff1a${file.name}`)
+        setReport(['可点击“校准ID”按当前模型检查并修复全部记录。'])
       } catch (error) {
         console.warn('Failed to import wire counter project', error)
         setStatus(`\u9879\u76ee\u5bfc\u5165\u5931\u8d25\uff1a${file.name}`)
+        setReport(['项目导入失败，请确认 JSON 文件来自本插件导出。'])
       }
     })
     reader.readAsText(file, 'utf-8')
@@ -1761,6 +1868,17 @@
         line-height: 1.5;
       }
       .awc-drag-hint { color: #64748b; }
+      .awc-report {
+        margin-top: 8px;
+        max-height: 92px;
+        overflow: auto;
+        border-left: 3px solid #38bdf8;
+        padding: 6px 8px;
+        background: rgba(239, 246, 255, 0.8);
+        color: #334155;
+        font-size: 12px;
+        line-height: 1.45;
+      }
       .awc-toolbar {
         display: grid;
         grid-template-columns: minmax(120px, 0.9fr) minmax(160px, 1.4fr) minmax(130px, 0.9fr) minmax(90px, 0.6fr);
@@ -2288,6 +2406,7 @@
       <div class="awc-drag-hint">${TEXT.dragHint}</div>
       <div class="awc-summary"></div>
       <div class="awc-status">${TEXT.waitingViewer}</div>
+      <div class="awc-report" hidden></div>
     `
 
     const toolbar = document.createElement('div')
@@ -2348,6 +2467,13 @@
       void captureCurrentSelection()
     })
 
+    const calibrateButton = document.createElement('button')
+    calibrateButton.className = 'awc-button awc-button-secondary'
+    calibrateButton.textContent = TEXT.calibrateButton
+    calibrateButton.addEventListener('click', () => {
+      void calibrateRecordedRows()
+    })
+
     const exportButton = document.createElement('button')
     exportButton.className = 'awc-button awc-button-secondary'
     exportButton.textContent = TEXT.exportButton
@@ -2371,10 +2497,12 @@
       state.collapsedCircuits.clear()
       persistState()
       renderRows()
+      setReport([])
       setStatus(TEXT.cleared)
     })
 
     buttons.appendChild(captureButton)
+    buttons.appendChild(calibrateButton)
     buttons.appendChild(exportButton)
     buttons.appendChild(exportProjectButton)
     buttons.appendChild(importProjectButton)
@@ -2434,6 +2562,7 @@
     state.panel = panel
     state.headEl = head
     state.statusEl = head.querySelector('.awc-status')
+    state.reportEl = head.querySelector('.awc-report')
     state.summaryEl = head.querySelector('.awc-summary')
     state.totalsEl = totals
     state.tbodyEl = tableWrap.querySelector('tbody')
@@ -2992,13 +3121,13 @@
         return
       }
 
-      if (!hasWirePixelNearPointer(viewer, event)) {
+      const verifiedRow = await findRecordedRowForHoverDbId(model, dbId)
+      if (!verifiedRow) {
         hideHoverTooltip()
         return
       }
 
-      const verifiedRow = await findRecordedRowForHoverDbId(model, dbId)
-      if (!verifiedRow) {
+      if (!getRowStableElementId(verifiedRow) && !hasWirePixelNearPointer(viewer, event)) {
         hideHoverTooltip()
         return
       }
